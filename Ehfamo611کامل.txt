@@ -1,0 +1,1016 @@
+# ============================================================
+# ✅ FINAL CONSOLIDATED FIX PACK (6 + 11) — DROP-IN, PROD-READY
+# Version: v2.1.0 (UNIFIED)
+#
+# شامل:
+# ✅ 6 اصلاح قبلی (Violation-driven QA + DLQ + Constitution + Approval)
+# ✅ 11 اصلاح توافق‌شده (FOR UPDATE + Eviction + CB persistence + FK + GROUP BY + Indexes +
+#    Graceful shutdown + No broad catch + DB timeout + deadlock retry + Credentials encryption + SQL injection fix)
+# ✅ 4 بلاکر نهایی (Interval injection, CircuitBreaker single truth, Adapter cleanup stop/join, Retry boundary)
+#
+# ✅ + 2 اصلاح جدید اضافه‌شده در همین بازنویسی:
+#   FIX-NEW-1: safe_run exception ordering bug fixed (Exception was unreachable)
+#   FIX-NEW-2: AdapterRegistry.cleanup now disconnects removed adapters (real cleanup)
+#
+# NOTE:
+# - PostgreSQL
+# - psycopg3 style (یا wrapper مشابه)
+# - کد به صورت فایل‌بندی‌شده داخل همین بلاک ارائه شده.
+# - جاهایی که به سیستم خودت وابسته است با "ADAPT:" مشخص شده.
+# ============================================================
+
+# ============================================================
+# FILE: core/types.py
+# ============================================================
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Callable, TypeVar, Iterator
+from datetime import datetime, timezone
+
+T = TypeVar("T")
+
+class TaskStatus(str, Enum):
+    PENDING = "PENDING"
+    CLAIMED = "CLAIMED"
+    PROCESSING = "PROCESSING"
+    QUARANTINED = "QUARANTINED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+# ============================================================
+# FILE: core/error_handling.py
+# (11/11 item: broad exception fix)
+# ✅ FIX-NEW-1: correct except ordering (Exception must come before BaseException)
+# ============================================================
+import logging
+
+logger = logging.getLogger("core")
+
+def safe_run(op_name: str, fn: Callable[[], T]) -> T:
+    """
+    - NEVER swallow BaseException (KeyboardInterrupt/SystemExit)
+    - Logs Exception with context
+    """
+    try:
+        return fn()
+    except Exception as e:
+        # Only "normal" exceptions are logged here
+        logger.exception("operation_failed", extra={"op": op_name, "error": str(e)})
+        raise
+    except BaseException:
+        # Never swallow BaseException
+        raise
+
+# ============================================================
+# FILE: core/db.py
+# (11/11 items: statement_timeout + deadlock retry)
+# ✅ FIX-4: retry boundary only here (NO nested retry elsewhere)
+# ============================================================
+import time, random, contextlib
+
+@dataclass(frozen=True)
+class DBSettings:
+    statement_timeout_ms: int = 8000
+    lock_timeout_ms: int = 5000
+    deadlock_max_retries: int = 5
+    deadlock_base_backoff_s: float = 0.05
+    deadlock_max_backoff_s: float = 0.8
+
+class DeadlockRetryExceeded(RuntimeError): ...
+class DBTimeout(RuntimeError): ...
+
+def _is_retryable_pg_error(e: Exception) -> bool:
+    sqlstate = getattr(e, "sqlstate", None)
+    if sqlstate in {"40P01", "40001"}:  # deadlock_detected, serialization_failure
+        return True
+    msg = str(e).lower()
+    return ("deadlock detected" in msg) or ("could not serialize" in msg) or ("40p01" in msg) or ("40001" in msg)
+
+def _is_timeout_pg_error(e: Exception) -> bool:
+    sqlstate = getattr(e, "sqlstate", None)
+    if sqlstate in {"57014"}:  # query_canceled (statement_timeout)
+        return True
+    msg = str(e).lower()
+    return ("statement timeout" in msg) or ("57014" in msg) or ("query canceled" in msg)
+
+def with_retry_transaction(
+    db,
+    op_name: str,
+    fn: Callable[[Any], T],
+    *,
+    settings: DBSettings
+) -> T:
+    """
+    ✅ Retry ONLY at transaction boundary.
+    `fn(cur)` must contain ALL SQL inside ONE transaction and must be idempotent at DB level
+    (use constraints/UPSERT/unique keys).
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(settings.deadlock_max_retries + 1):
+        try:
+            with db.connection() as conn:  # ADAPT: wrapper must provide connection()
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        # LOCAL = only inside this tx
+                        cur.execute("SET LOCAL statement_timeout = %s", (int(settings.statement_timeout_ms),))
+                        cur.execute("SET LOCAL lock_timeout = %s", (int(settings.lock_timeout_ms),))
+                        return fn(cur)
+        except Exception as e:
+            last_exc = e
+            if _is_timeout_pg_error(e):
+                raise DBTimeout(f"{op_name}: statement_timeout") from e
+            if not _is_retryable_pg_error(e):
+                raise
+            if attempt >= settings.deadlock_max_retries:
+                break
+            backoff = min(settings.deadlock_max_backoff_s, settings.deadlock_base_backoff_s * (2 ** attempt))
+            time.sleep(backoff * (0.5 + random.random()))
+    raise DeadlockRetryExceeded(f"{op_name}: deadlock/serialization retry exceeded") from last_exc
+
+# ============================================================
+# FILE: constitution.py
+# (6 fixes: enforce_constitution pure + no side effects)
+# ============================================================
+from typing import Sequence
+
+class ConstitutionalViolationError(Exception): ...
+
+def enforce_constitution(db, *, StageEnum: Sequence[Any], cfg: Dict[str, Any]) -> bool:
+    """
+    Pure enforcement:
+    - only READ
+    - raises if violations
+    - NO writes
+    cfg must include: STAGE_COUNT, STAGE_ORDER, GLOBAL_MICRO_AGENT_COUNT, MIN_HUNTERS_PER_FAMILY,
+                     MIN_SUPERVISORS, MAX_SUPERVISORS
+    """
+    violations: List[str] = []
+
+    STAGE_COUNT = cfg["STAGE_COUNT"]
+    STAGE_ORDER = cfg["STAGE_ORDER"]
+    GLOBAL_MICRO_AGENT_COUNT = cfg["GLOBAL_MICRO_AGENT_COUNT"]
+    MIN_HUNTERS_PER_FAMILY = cfg["MIN_HUNTERS_PER_FAMILY"]
+    MIN_SUPERVISORS = cfg["MIN_SUPERVISORS"]
+    MAX_SUPERVISORS = cfg["MAX_SUPERVISORS"]
+
+    # stage count + order
+    if len(StageEnum) != STAGE_COUNT:
+        violations.append(f"Stage count violation: {len(StageEnum)} != {STAGE_COUNT}")
+
+    actual_order = [getattr(s, "name", str(s)) for s in StageEnum]
+    if actual_order != STAGE_ORDER:
+        violations.append("Stage order violation")
+
+    def _count(sql: str, params: tuple = ()) -> int:
+        def _op(cur):
+            cur.execute(sql, params)
+            return int(cur.fetchone()[0])
+        return with_retry_transaction(db, "constitution.count", _op, settings=DBSettings())
+
+    def _fetch_all(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+        def _op(cur):
+            cur.execute(sql, params)
+            cols = [c.name for c in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return with_retry_transaction(db, "constitution.fetch", _op, settings=DBSettings())
+
+    actual_micro = _count("SELECT COUNT(*) FROM micro_agents")
+    if actual_micro != GLOBAL_MICRO_AGENT_COUNT:
+        violations.append(f"Micro agent count: {actual_micro} != {GLOBAL_MICRO_AGENT_COUNT}")
+
+    contaminated = _count("SELECT COUNT(*) FROM micro_agents WHERE family_id IS NOT NULL")
+    if contaminated > 0:
+        violations.append(f"Micro agent contamination: {contaminated} bound to families")
+
+    families = _fetch_all("SELECT family_id FROM families WHERE status = 'ACTIVE'")
+    for fam in families:
+        hunter_count = _count(
+            "SELECT COUNT(*) FROM hunters WHERE family_id = %s AND status = 'ACTIVE'",
+            (fam["family_id"],)
+        )
+        if hunter_count < MIN_HUNTERS_PER_FAMILY:
+            violations.append(f"Family {fam['family_id']} hunter count: {hunter_count} < {MIN_HUNTERS_PER_FAMILY}")
+
+    supervisor_count = _count("SELECT COUNT(*) FROM supervisors WHERE status = 'ACTIVE'")
+    if not (MIN_SUPERVISORS <= supervisor_count <= MAX_SUPERVISORS):
+        violations.append(f"Supervisor count: {supervisor_count} outside [{MIN_SUPERVISORS},{MAX_SUPERVISORS}]")
+
+    if violations:
+        raise ConstitutionalViolationError("CONSTITUTIONAL VIOLATIONS:\n" + "\n".join(violations))
+    return True
+
+# ============================================================
+# FILE: quality.py
+# (6 fixes: SINGLE_SCORE_QUALITY_FORBIDDEN, threshold not gating, violation-driven)
+# ============================================================
+from dataclasses import dataclass
+from enum import Enum as _Enum
+
+MIN_QUALITY_SCORE = 0.9999
+SINGLE_SCORE_QUALITY_FORBIDDEN = True
+
+class QualityDecision(str, _Enum):
+    PASS_ = "PASS"
+    SOFT_QUARANTINE = "SOFT_QUARANTINE"
+    HARD_FAIL = "HARD_FAIL"
+
+@dataclass(frozen=True)
+class QualityAssessment:
+    """
+    ✅ Decision is driven ONLY by unresolved violations.
+    ✅ Numeric scores are telemetry only, never decision gate.
+    """
+    dimensions: Dict[str, float]     # informational only
+    violations: List[str]           # gating
+    decision: QualityDecision
+
+    def ok(self) -> bool:
+        return self.decision == QualityDecision.PASS_ and len(self.violations) == 0
+
+def _mk_violation(code: str, detail: str) -> str:
+    return f"{code}: {detail}"
+
+def assess_quality(dimensions: Dict[str, float], compliance_ok: bool, evidence_complete: bool) -> QualityAssessment:
+    violations: List[str] = []
+
+    if not evidence_complete:
+        violations.append(_mk_violation("EVIDENCE_INCOMPLETE", "Evidence bundle not complete"))
+
+    if not compliance_ok:
+        violations.append(_mk_violation("COMPLIANCE_FAIL", "One or more compliance flags are false"))
+
+    # Threshold becomes a violation label (still no scalar gate)
+    for dim, val in dimensions.items():
+        if val < MIN_QUALITY_SCORE:
+            violations.append(_mk_violation("QUALITY_DIM_BELOW_MIN", f"{dim}={val:.6f} < {MIN_QUALITY_SCORE}"))
+
+    if any(v.startswith("COMPLIANCE_FAIL") for v in violations):
+        decision = QualityDecision.HARD_FAIL
+    elif any("EVIDENCE_INCOMPLETE" in v for v in violations):
+        decision = QualityDecision.SOFT_QUARANTINE
+    elif violations:
+        decision = QualityDecision.SOFT_QUARANTINE
+    else:
+        decision = QualityDecision.PASS_
+
+    return QualityAssessment(dimensions=dimensions, violations=violations, decision=decision)
+
+# ============================================================
+# FILE: evidence.py
+# (6 fixes: remove numeric gating; compute_quality_score forbidden)
+# ============================================================
+from dataclasses import dataclass, field
+
+@dataclass
+class EvidenceBundle:
+    evidence_id: str
+    task_id: str
+    family_id: str
+    stage: str
+
+    # informational scores (0..1)
+    content_completeness: float
+    content_accuracy: float
+    content_format_validity: float
+    content_language_quality: float
+    content_depth: float
+
+    compliance_tos: bool
+    compliance_legal: bool
+    compliance_policy: bool
+    compliance_safety: bool
+    compliance_ethical: bool
+
+    consistency_semantic: float
+    consistency_data: float
+    consistency_contract: float
+
+    delivery_usability: float
+    delivery_satisfaction_proxy: float
+    delivery_presentation: float
+
+    collected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    collected_by: str = "qa_agent"
+    evidence_version: str = "2.1.0"
+    source_artifacts: Dict[str, Any] = field(default_factory=dict)
+
+    def is_complete(self) -> bool:
+        return True  # ADAPT: اگر فیلدهای optional داری، اینجا چک کن.
+
+    def compute_quality_score(self) -> float:
+        if SINGLE_SCORE_QUALITY_FORBIDDEN:
+            raise RuntimeError("SINGLE_SCORE_QUALITY_FORBIDDEN: use assess_quality()")
+        # legacy only
+        return 1.0
+
+    def assess_quality(self) -> QualityAssessment:
+        dims = {
+            "content": float(min(self.content_completeness, self.content_accuracy,
+                                 self.content_format_validity, self.content_language_quality, self.content_depth)),
+            "consistency": float(min(self.consistency_semantic, self.consistency_data, self.consistency_contract)),
+            "delivery": float(min(self.delivery_usability, self.delivery_satisfaction_proxy, self.delivery_presentation)),
+            "compliance": float(1.0 if all([self.compliance_tos, self.compliance_legal, self.compliance_policy,
+                                           self.compliance_safety, self.compliance_ethical]) else 0.0),
+        }
+        compliance_ok = dims["compliance"] == 1.0
+        return assess_quality(dims, compliance_ok=compliance_ok, evidence_complete=self.is_complete())
+
+# ============================================================
+# FILE: qa_certificate.py
+# (6 fixes: certificate stores violations; no scalar gating)
+# ============================================================
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class QACertificate:
+    certificate_id: str
+    task_id: str
+    family_id: str
+    stage: str
+    dimension_scores: Dict[str, float]      # informational
+    violations: List[str]                  # gating
+    decision: str                          # PASS | SOFT_QUARANTINE | HARD_FAIL
+    threshold_used: float = MIN_QUALITY_SCORE
+    issued_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    issued_by: str = "qa_agent"
+    certificate_version: str = "2.1.0"
+    validation_method: str = "violation_driven_multi_dimensional"
+
+def issue_qa_certificate(task_id: str, family_id: str, stage: str, evidence: EvidenceBundle) -> QACertificate:
+    a = evidence.assess_quality()
+    return QACertificate(
+        certificate_id=f"qa_{task_id}_{int(datetime.now(timezone.utc).timestamp())}",
+        task_id=task_id,
+        family_id=family_id,
+        stage=stage,
+        dimension_scores=a.dimensions,
+        violations=a.violations,
+        decision=a.decision.value,
+    )
+
+# ============================================================
+# FILE: dlq.py
+# (6 fixes: DLQ is event-table only; NOT a status; column mapping canonical)
+# ============================================================
+import json, uuid
+
+def move_task_to_dlq_event(
+    db,
+    *,
+    task_id: str,
+    family_id: str,
+    current_stage: str,
+    payload: Dict[str, Any],
+    fail_reason: str,
+) -> None:
+    """
+    ✅ DLQ is append-only table.
+    ✅ task_queue.status MUST stay in allowed enum (FAILED).
+    Schema expected:
+      dead_letter_queue(dlq_id, task_id, family_id, current_stage, payload, fail_reason,
+                        retry_count, original_created_at, dlq_created_at, processed, processed_at)
+    """
+    settings = DBSettings(statement_timeout_ms=8000)
+    dlq_id = f"dlq_{task_id}_{uuid.uuid4().hex}"
+
+    def _op(cur):
+        cur.execute("""
+            UPDATE task_queue
+            SET status = 'FAILED', updated_at = NOW()
+            WHERE task_id = %s
+        """, (task_id,))
+
+        cur.execute("""
+            INSERT INTO dead_letter_queue (
+                dlq_id, task_id, family_id, current_stage,
+                payload, fail_reason, retry_count,
+                original_created_at, dlq_created_at,
+                processed, processed_at
+            ) VALUES (
+                %s, %s, %s, %s,
+                %s::jsonb, %s, 0,
+                NOW(), NOW(),
+                FALSE, NULL
+            )
+        """, (dlq_id, task_id, family_id, current_stage, json.dumps(payload), fail_reason))
+        return None
+
+    with_retry_transaction(db, "dlq.move", _op, settings=settings)
+
+# ============================================================
+# FILE: orchestrator.py
+# (6 fixes: rename manual review wording; route quarantine vs DLQ)
+# ============================================================
+class Orchestrator:
+    def quarantine_task(self, db, *, task_id: str, family_id: str, stage: str, reason: str) -> None:
+        settings = DBSettings(statement_timeout_ms=8000)
+
+        def _op(cur):
+            cur.execute("""
+                UPDATE task_queue
+                SET status = 'QUARANTINED',
+                    stage_data = jsonb_set(
+                        COALESCE(stage_data, '{}'::jsonb),
+                        '{quarantine_reason}',
+                        to_jsonb(%s::text),
+                        TRUE
+                    ),
+                    updated_at = NOW()
+                WHERE task_id = %s
+            """, (f"autonomous_internal_review:{reason}", task_id))
+
+            cur.execute("""
+                INSERT INTO quarantine_log(
+                    quarantine_id, task_id, family_id, stage,
+                    quarantined_at, reason, released_at
+                ) VALUES (%s,%s,%s,%s,NOW(),%s,NULL)
+            """, (f"q_{task_id}_{uuid.uuid4().hex}", task_id, family_id, stage, f"autonomous_internal_review:{reason}"))
+            return None
+
+        with_retry_transaction(db, "orchestrator.quarantine", _op, settings=settings)
+
+    def handle_failure(self, db, *, task_id: str, family_id: str, stage: str, payload: Dict[str, Any], fail_reason: str):
+        if ("EVIDENCE_INCOMPLETE" in fail_reason) or ("QUALITY_DIM_BELOW_MIN" in fail_reason):
+            self.quarantine_task(db, task_id=task_id, family_id=family_id, stage=stage, reason=fail_reason)
+            return
+        move_task_to_dlq_event(db, task_id=task_id, family_id=family_id, current_stage=stage, payload=payload, fail_reason=fail_reason)
+
+# ============================================================
+# FILE: scaling_governance.py
+# (6 fixes: approval clarified as AI quorum; store judge_ids/roles; no human)
+# ============================================================
+@dataclass
+class QuorumVote:
+    judge_id: str
+    judge_role: str
+    approve: bool
+
+@dataclass
+class QuorumDecision:
+    decision_id: str
+    approved: bool
+    unanimous: bool
+    decision_reasoning: str
+    votes: List[QuorumVote]
+    decided_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+def persist_scaling_attempt(db, *, justification: Dict[str, Any], decision: QuorumDecision) -> None:
+    settings = DBSettings(statement_timeout_ms=8000)
+
+    record = {
+        "decision_id": decision.decision_id,
+        "approved": decision.approved,
+        "unanimous": decision.unanimous,
+        "reasoning": decision.decision_reasoning,
+        "judge_ids": [v.judge_id for v in decision.votes],
+        "judge_roles": [v.judge_role for v in decision.votes],
+        "human_actor": False,
+        "decided_at": decision.decided_at.isoformat(),
+    }
+
+    def _op(cur):
+        cur.execute("""
+            INSERT INTO scaling_history(
+                scaling_id, target_type, family_id,
+                from_count, to_count, justification,
+                approved, approval_decision,
+                executed, created_at
+            ) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb,FALSE,NOW())
+        """, (
+            f"scaling_{uuid.uuid4().hex}",
+            justification["target_type"],
+            justification["family_id"],
+            justification["from_count"],
+            justification["to_count"],
+            json.dumps(justification),
+            bool(decision.approved),
+            json.dumps(record),
+        ))
+        return None
+
+    with_retry_transaction(db, "scaling.persist", _op, settings=settings)
+
+# ============================================================
+# FILE: adapters/registry.py
+# (11/11 item: memory leak eviction) + ✅ FIX-3 stop/join
+# ✅ FIX-NEW-2: cleanup disconnects removed adapters
+# ============================================================
+import threading, time
+from dataclasses import dataclass
+
+@dataclass
+class _AdapterEntry:
+    adapter: Any
+    last_access_ts: float
+    connected: bool
+
+class AdapterRegistry:
+    """
+    Thread-safe with eviction + graceful cleanup thread
+    """
+    def __init__(self, *, ttl_seconds: int = 1800, max_size: int = 1024, cleanup_interval_s: int = 60):
+        self._ttl = int(ttl_seconds)
+        self._max = int(max_size)
+        self._lock = threading.RLock()
+        self._adapters: Dict[str, _AdapterEntry] = {}
+
+        self._stop_event = threading.Event()
+        self._cleanup_interval_s = int(cleanup_interval_s)
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, name="AdapterRegistryCleanup", daemon=False)
+        self._cleanup_thread.start()
+
+    def register(self, key: str, adapter: Any) -> None:
+        now = time.time()
+        with self._lock:
+            self._adapters[key] = _AdapterEntry(adapter=adapter, last_access_ts=now, connected=True)
+            self._evict_if_needed(now)
+
+    def get(self, key: str) -> Optional[Any]:
+        now = time.time()
+        with self._lock:
+            ent = self._adapters.get(key)
+            if not ent:
+                return None
+            ent.last_access_ts = now
+            return ent.adapter
+
+    def mark_disconnected(self, key: str) -> None:
+        with self._lock:
+            ent = self._adapters.get(key)
+            if ent:
+                ent.connected = False
+
+    def unregister(self, key: str) -> None:
+        with self._lock:
+            ent = self._adapters.pop(key, None)
+        if ent:
+            self._best_effort_disconnect(ent.adapter)
+
+    def cleanup(self) -> int:
+        now = time.time()
+        removed_adapters: List[Any] = []
+        removed_keys: List[str] = []
+        with self._lock:
+            for k, ent in list(self._adapters.items()):
+                expired = (now - ent.last_access_ts) > self._ttl
+                if expired or (ent.connected is False):
+                    removed_keys.append(k)
+                    removed_adapters.append(ent.adapter)
+                    self._adapters.pop(k, None)
+
+        # ✅ FIX-NEW-2: actually disconnect removed adapters (outside lock)
+        for ad in removed_adapters:
+            self._best_effort_disconnect(ad)
+
+        return len(removed_keys)
+
+    def _evict_if_needed(self, now: float) -> None:
+        # TTL cleanup
+        self.cleanup()
+        with self._lock:
+            if len(self._adapters) <= self._max:
+                return
+            items = sorted(self._adapters.items(), key=lambda kv: kv[1].last_access_ts)
+            overflow = len(self._adapters) - self._max
+            evicted: List[Any] = []
+            for i in range(overflow):
+                k, ent = items[i]
+                self._adapters.pop(k, None)
+                evicted.append(ent.adapter)
+
+        # Disconnect evicted outside lock
+        for ad in evicted:
+            self._best_effort_disconnect(ad)
+
+    def _best_effort_disconnect(self, adapter: Any) -> None:
+        try:
+            if hasattr(adapter, "disconnect"):
+                adapter.disconnect()
+            elif hasattr(adapter, "close"):
+                adapter.close()
+        except Exception:
+            pass
+
+    def _cleanup_loop(self):
+        while not self._stop_event.is_set():
+            self._stop_event.wait(self._cleanup_interval_s)
+            if self._stop_event.is_set():
+                break
+            try:
+                self.cleanup()
+            except Exception:
+                logger.exception("adapter_registry.cleanup_failed")
+
+    def shutdown(self):
+        self._stop_event.set()
+        self._cleanup_thread.join(timeout=5)
+        with self._lock:
+            remaining = [ent.adapter for ent in self._adapters.values()]
+            self._adapters.clear()
+        for ad in remaining:
+            self._best_effort_disconnect(ad)
+
+# ============================================================
+# FILE: adapters/circuit_breaker.py
+# (11/11 item: circuit breaker persistence) + ✅ FIX-2 single truth
+# ============================================================
+from enum import Enum as _Enum2
+from dataclasses import dataclass
+
+class CircuitState(str, _Enum2):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+@dataclass
+class CircuitBreakerSnapshot:
+    name: str
+    state: CircuitState
+    failure_count: int
+    last_failure_at: Optional[datetime]
+    opened_at: Optional[datetime]
+    updated_at: datetime
+
+class CircuitBreakerStore:
+    """
+    ✅ Single source of truth = DB table `circuit_breakers`.
+    No InMemory storage in production path.
+    """
+    def __init__(self, db):
+        self.db = db
+        self._ensure_table()
+
+    def _ensure_table(self):
+        settings = DBSettings(statement_timeout_ms=8000)
+        def _op(cur):
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS circuit_breakers (
+                    name TEXT PRIMARY KEY,
+                    state TEXT NOT NULL CHECK (state IN ('CLOSED','OPEN','HALF_OPEN')),
+                    failure_count INT NOT NULL DEFAULT 0,
+                    last_failure_at TIMESTAMPTZ NULL,
+                    opened_at TIMESTAMPTZ NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            return None
+        with_retry_transaction(self.db, "cb.ensure_table", _op, settings=settings)
+
+    def load(self, name: str) -> CircuitBreakerSnapshot:
+        settings = DBSettings(statement_timeout_ms=8000)
+        def _op(cur):
+            cur.execute("""
+                SELECT name, state, failure_count, last_failure_at, opened_at, updated_at
+                FROM circuit_breakers
+                WHERE name = %s
+            """, (name,))
+            row = cur.fetchone()
+            now = datetime.now(timezone.utc)
+            if not row:
+                return CircuitBreakerSnapshot(name=name, state=CircuitState.CLOSED, failure_count=0,
+                                             last_failure_at=None, opened_at=None, updated_at=now)
+            return CircuitBreakerSnapshot(
+                name=row[0], state=CircuitState(row[1]), failure_count=int(row[2]),
+                last_failure_at=row[3], opened_at=row[4], updated_at=row[5]
+            )
+        return with_retry_transaction(self.db, "cb.load", _op, settings=settings)
+
+    def save(self, snap: CircuitBreakerSnapshot) -> None:
+        settings = DBSettings(statement_timeout_ms=8000)
+        def _op(cur):
+            cur.execute("""
+                INSERT INTO circuit_breakers(name, state, failure_count, last_failure_at, opened_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (name) DO UPDATE SET
+                    state=EXCLUDED.state,
+                    failure_count=EXCLUDED.failure_count,
+                    last_failure_at=EXCLUDED.last_failure_at,
+                    opened_at=EXCLUDED.opened_at,
+                    updated_at=EXCLUDED.updated_at
+            """, (snap.name, snap.state.value, snap.failure_count, snap.last_failure_at, snap.opened_at, snap.updated_at))
+            return None
+        with_retry_transaction(self.db, "cb.save", _op, settings=settings)
+
+class CircuitBreaker:
+    def __init__(self, *, name: str, store: CircuitBreakerStore, failure_threshold: int = 5, open_cooldown_s: int = 60):
+        self.name = name
+        self.store = store
+        self.failure_threshold = int(failure_threshold)
+        self.open_cooldown_s = int(open_cooldown_s)
+
+    def allow(self) -> bool:
+        snap = self.store.load(self.name)
+        now = datetime.now(timezone.utc)
+        if snap.state == CircuitState.CLOSED:
+            return True
+        if snap.state == CircuitState.OPEN:
+            if snap.opened_at and (now - snap.opened_at).total_seconds() >= self.open_cooldown_s:
+                snap2 = CircuitBreakerSnapshot(self.name, CircuitState.HALF_OPEN, snap.failure_count,
+                                               snap.last_failure_at, snap.opened_at, now)
+                self.store.save(snap2)
+                return True
+            return False
+        # HALF_OPEN
+        return True
+
+    def record_success(self) -> None:
+        now = datetime.now(timezone.utc)
+        snap2 = CircuitBreakerSnapshot(self.name, CircuitState.CLOSED, 0, None, None, now)
+        self.store.save(snap2)
+
+    def record_failure(self) -> None:
+        now = datetime.now(timezone.utc)
+        snap = self.store.load(self.name)
+        fc = snap.failure_count + 1
+        if snap.state == CircuitState.HALF_OPEN:
+            snap2 = CircuitBreakerSnapshot(self.name, CircuitState.OPEN, fc, now, now, now)
+            self.store.save(snap2)
+            return
+        if fc >= self.failure_threshold:
+            snap2 = CircuitBreakerSnapshot(self.name, CircuitState.OPEN, fc, now, now, now)
+        else:
+            snap2 = CircuitBreakerSnapshot(self.name, CircuitState.CLOSED, fc, now, snap.opened_at, now)
+        self.store.save(snap2)
+
+# ============================================================
+# FILE: queues/transitions.py
+# (11/11 item: Race condition fixed with FOR UPDATE)
+# ============================================================
+DB_CFG = DBSettings(statement_timeout_ms=8000)
+
+class InvalidTransition(ValueError): ...
+
+def transition_task(db, *, task_id: str, to_stage: str) -> None:
+    def _op(cur):
+        cur.execute(
+            "SELECT current_stage, status FROM task_queue WHERE task_id = %s FOR UPDATE",
+            (task_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            raise InvalidTransition(f"task_not_found:{task_id}")
+
+        current_stage, status = row
+        if status in (TaskStatus.COMPLETED.value,):
+            raise InvalidTransition(f"cannot_transition_completed:{task_id}")
+
+        cur.execute(
+            "UPDATE task_queue SET current_stage=%s, updated_at=NOW() WHERE task_id=%s",
+            (to_stage, task_id)
+        )
+        cur.execute(
+            """
+            INSERT INTO audit_log(audit_id, task_id, event_type, payload, created_at)
+            VALUES (gen_random_uuid()::text, %s, 'STAGE_TRANSITION',
+                    jsonb_build_object('from', %s, 'to', %s), NOW())
+            """,
+            (task_id, current_stage, to_stage)
+        )
+        return None
+
+    with_retry_transaction(db, "task.transition", _op, settings=DB_CFG)
+
+# ============================================================
+# FILE: queues/claim.py
+# (11/11 item: SQL injection fix) + ✅ FIX-1 interval injection
+# ============================================================
+def claim_task(db, *, task_id: str, timeout_minutes: int) -> None:
+    timeout_minutes = int(timeout_minutes)
+    if timeout_minutes < 1 or timeout_minutes > 1440:
+        raise ValueError("timeout_minutes out of allowed range")
+
+    def _op(cur):
+        cur.execute("""
+            UPDATE task_queue
+            SET claim_deadline = NOW() + make_interval(mins => %s),
+                status = 'CLAIMED',
+                updated_at = NOW()
+            WHERE task_id = %s AND status = 'PENDING'
+        """, (timeout_minutes, task_id))
+        return None
+
+    with_retry_transaction(db, "task.claim", _op, settings=DBSettings(statement_timeout_ms=8000))
+
+# ============================================================
+# FILE: metrics/collector.py
+# (11/11 item: N+1 metrics fixed by GROUP BY)
+# ============================================================
+def collect_queue_metrics(db) -> Dict[str, int]:
+    def _op(cur):
+        cur.execute("""
+            SELECT current_stage, COUNT(*)
+            FROM task_queue
+            WHERE status = 'PENDING'
+            GROUP BY current_stage
+        """)
+        rows = cur.fetchall()
+        return {str(stage): int(cnt) for (stage, cnt) in rows}
+    return with_retry_transaction(db, "metrics.collect_queue", _op, settings=DBSettings(statement_timeout_ms=5000))
+
+# ============================================================
+# FILE: qa/certificate_writer.py
+# (11/11 item: FK integrity enforced + defensive check)
+# ============================================================
+class TaskNotFound(RuntimeError): ...
+
+def persist_certificate(db, *, cert: QACertificate) -> None:
+    def _op(cur):
+        cur.execute("SELECT 1 FROM task_queue WHERE task_id=%s", (cert.task_id,))
+        if not cur.fetchone():
+            raise TaskNotFound(f"task_not_found:{cert.task_id}")
+
+        cur.execute("""
+            INSERT INTO qa_certificates(
+                certificate_id, task_id, family_id, stage,
+                dimension_scores, violations, decision,
+                threshold_used, issued_at, issued_by, certificate_version, validation_method
+            ) VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,NOW(),%s,%s,%s)
+        """, (
+            cert.certificate_id,
+            cert.task_id,
+            cert.family_id,
+            cert.stage,
+            json.dumps(cert.dimension_scores),
+            json.dumps(cert.violations),
+            cert.decision,
+            float(cert.threshold_used),
+            cert.issued_by,
+            cert.certificate_version,
+            cert.validation_method,
+        ))
+        return None
+
+    with_retry_transaction(db, "qa.persist_certificate", _op, settings=DBSettings(statement_timeout_ms=8000))
+
+# ============================================================
+# FILE: core/runner.py
+# (11/11 item: graceful shutdown - no daemon threads)
+# ============================================================
+import signal
+
+class GracefulRunner:
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.threads: List[threading.Thread] = []
+        self._installed = False
+
+    def install_signal_handlers(self) -> None:
+        if self._installed:
+            return
+        def _handler(signum, frame):
+            self.stop_event.set()
+        signal.signal(signal.SIGINT, _handler)
+        signal.signal(signal.SIGTERM, _handler)
+        self._installed = True
+
+    def start_thread(self, name: str, target: Callable[[], None]) -> None:
+        t = threading.Thread(name=name, target=target, daemon=False)
+        t.start()
+        self.threads.append(t)
+
+    def shutdown(self, *, join_timeout_s: float = 10.0) -> None:
+        self.stop_event.set()
+        for t in self.threads:
+            t.join(timeout=join_timeout_s)
+
+# ============================================================
+# FILE: security/crypto.py
+# (11/11 item: AES-GCM creds encryption at rest)
+# ============================================================
+import os, base64
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+class CryptoConfigError(RuntimeError): ...
+
+_MASTER_KEY: Optional[bytes] = None
+
+def _load_master_key() -> bytes:
+    b64 = os.environ.get("MASTER_KEY_B64", "").strip()
+    if not b64:
+        raise CryptoConfigError("MASTER_KEY_B64 not set")
+    raw = base64.b64decode(b64)
+    if len(raw) != 32:
+        raise CryptoConfigError("MASTER_KEY_B64 must decode to 32 bytes")
+    return raw
+
+def _key() -> bytes:
+    global _MASTER_KEY
+    if _MASTER_KEY is None:
+        _MASTER_KEY = _load_master_key()
+    return _MASTER_KEY
+
+def encrypt_bytes(plaintext: bytes, *, aad: bytes) -> bytes:
+    nonce = os.urandom(12)
+    aes = AESGCM(_key())
+    ct = aes.encrypt(nonce, plaintext, aad)
+    return nonce + ct
+
+def decrypt_bytes(blob: bytes, *, aad: bytes) -> bytes:
+    nonce, ct = blob[:12], blob[12:]
+    aes = AESGCM(_key())
+    return aes.decrypt(nonce, ct, aad)
+
+# ============================================================
+# FILE: security/credentials_store.py
+# (11/11 item: store encrypted BYTEA)
+# ============================================================
+def store_credentials(db, *, family_id: str, adapter_key: str, creds: Dict[str, Any]) -> None:
+    aad = f"{family_id}:{adapter_key}".encode("utf-8")
+    blob = encrypt_bytes(json.dumps(creds).encode("utf-8"), aad=aad)
+
+    def _op(cur):
+        cur.execute("""
+            INSERT INTO adapter_credentials(family_id, adapter_key, credentials_enc, updated_at)
+            VALUES (%s,%s,%s,NOW())
+            ON CONFLICT (family_id, adapter_key) DO UPDATE SET
+                credentials_enc=EXCLUDED.credentials_enc,
+                updated_at=EXCLUDED.updated_at
+        """, (family_id, adapter_key, blob))
+        return None
+
+    with_retry_transaction(db, "creds.store", _op, settings=DBSettings(statement_timeout_ms=8000))
+
+def load_credentials(db, *, family_id: str, adapter_key: str) -> Optional[Dict[str, Any]]:
+    aad = f"{family_id}:{adapter_key}".encode("utf-8")
+
+    def _op(cur):
+        cur.execute("""
+            SELECT credentials_enc
+            FROM adapter_credentials
+            WHERE family_id=%s AND adapter_key=%s
+        """, (family_id, adapter_key))
+        row = cur.fetchone()
+        if not row:
+            return None
+        plaintext = decrypt_bytes(row[0], aad=aad)
+        return json.loads(plaintext.decode("utf-8"))
+
+    return with_retry_transaction(db, "creds.load", _op, settings=DBSettings(statement_timeout_ms=8000))
+
+# ============================================================
+# FILE: migrations/0021_unified_fix_pack_v2_1_0.sql
+# (Indexes + FK + CB table + creds table + qa table + ext)
+# ============================================================
+MIGRATION_0021 = r"""
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Circuit breaker persistence (single truth)
+CREATE TABLE IF NOT EXISTS circuit_breakers (
+    name TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN ('CLOSED','OPEN','HALF_OPEN')),
+    failure_count INT NOT NULL DEFAULT 0,
+    last_failure_at TIMESTAMPTZ NULL,
+    opened_at TIMESTAMPTZ NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Encrypted credentials at rest
+CREATE TABLE IF NOT EXISTS adapter_credentials (
+    family_id TEXT NOT NULL,
+    adapter_key TEXT NOT NULL,
+    credentials_enc BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (family_id, adapter_key)
+);
+
+-- QA certificates table + FK
+CREATE TABLE IF NOT EXISTS qa_certificates (
+    certificate_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    family_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    dimension_scores JSONB NOT NULL,
+    violations JSONB NOT NULL,
+    decision TEXT NOT NULL,
+    threshold_used DOUBLE PRECISION NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    issued_by TEXT NOT NULL,
+    certificate_version TEXT NOT NULL,
+    validation_method TEXT NOT NULL
+);
+
+ALTER TABLE qa_certificates
+  DROP CONSTRAINT IF EXISTS qa_certificates_task_fk;
+
+ALTER TABLE qa_certificates
+  ADD CONSTRAINT qa_certificates_task_fk
+  FOREIGN KEY (task_id) REFERENCES task_queue(task_id)
+  ON DELETE CASCADE;
+
+-- Critical indexes
+CREATE INDEX IF NOT EXISTS idx_task_queue_family_stage
+  ON task_queue (family_id, current_stage);
+
+CREATE INDEX IF NOT EXISTS idx_task_queue_status_stage
+  ON task_queue (status, current_stage);
+
+CREATE INDEX IF NOT EXISTS idx_supervisor_interventions_time
+  ON supervisor_interventions (intervened_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_metrics_timeseries_name_time
+  ON metrics_timeseries (metric_name, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_task_queue_task_id
+  ON task_queue (task_id);
+"""

@@ -1,0 +1,213 @@
+# ============================================================
+# HARDENED CORE — PRODUCTION SAFE
+# ============================================================
+
+import json
+import uuid
+import threading
+import hashlib
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional
+from contextlib import contextmanager
+
+# ============================================================
+# 1️⃣ THREAD-SAFE SINGLETON REGISTRY
+# ============================================================
+
+class SingletonRegistry:
+    _instances: Dict[str, Any] = {}
+    _lock = threading.Lock()
+
+    @classmethod
+    def get(cls, key: str, factory):
+        if key not in cls._instances:
+            with cls._lock:
+                if key not in cls._instances:
+                    cls._instances[key] = factory()
+        return cls._instances[key]
+
+# ============================================================
+# 2️⃣ DISTRIBUTED LOCK + FAMILY UNIQUENESS
+# ============================================================
+
+@dataclass(frozen=True)
+class FamilyConfig:
+    hunter_count: int
+    supervisor_layer: int
+
+    def canonical_hash(self) -> str:
+        payload = json.dumps(self.__dict__, sort_keys=True).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+class FamilyAlreadyExists(Exception):
+    def __init__(self, family_id: str):
+        super().__init__(f"family_exists:{family_id}")
+        self.family_id = family_id
+
+class FamilyRegistry:
+    def __init__(self, db):
+        self.db = db
+
+    def create_family(self, config: FamilyConfig) -> str:
+        family_id = f"family_{uuid.uuid4().hex}"
+        config_hash = config.canonical_hash()
+
+        def tx(cur):
+            # 🔒 distributed uniqueness enforced by DB
+            cur.execute("""
+                INSERT INTO families (family_id, config_hash, config, status)
+                VALUES (%s, %s, %s::jsonb, 'ACTIVE')
+                ON CONFLICT (config_hash) DO NOTHING
+                RETURNING family_id
+            """, (family_id, config_hash, json.dumps(config.__dict__)))
+
+            row = cur.fetchone()
+            if row:
+                return row[0]
+
+            # someone else created it
+            cur.execute(
+                "SELECT family_id FROM families WHERE config_hash = %s",
+                (config_hash,)
+            )
+            existing = cur.fetchone()
+            raise FamilyAlreadyExists(existing[0])
+
+        return self.db.run_tx(tx)
+
+# ============================================================
+# 3️⃣ EVIDENCE INTEGRITY + LIFECYCLE
+# ============================================================
+
+@dataclass(frozen=True)
+class EvidenceBundle:
+    evidence_id: str
+    task_id: str
+    payload: Dict[str, Any]
+
+class EvidenceStore:
+    def __init__(self, db):
+        self.db = db
+
+    def persist(self, evidence: EvidenceBundle):
+        def tx(cur):
+            # 🔐 hard referential integrity
+            cur.execute(
+                "SELECT 1 FROM task_queue WHERE task_id = %s",
+                (evidence.task_id,)
+            )
+            if not cur.fetchone():
+                raise ValueError("task_not_found_for_evidence")
+
+            cur.execute("""
+                INSERT INTO evidence_bundles (evidence_id, task_id, payload)
+                VALUES (%s, %s, %s::jsonb)
+            """, (evidence.evidence_id, evidence.task_id, json.dumps(evidence.payload)))
+
+        self.db.run_tx(tx)
+
+    def cleanup_orphans(self):
+        # defensive GC for safety + compliance
+        self.db.execute("""
+            DELETE FROM evidence_bundles
+            WHERE task_id NOT IN (SELECT task_id FROM task_queue)
+        """)
+
+# ============================================================
+# 4️⃣ BOUNDED CONVERSATION CONTEXT (MEMORY SAFE)
+# ============================================================
+
+MAX_CONTEXT_MESSAGES = 50
+ARCHIVE_THRESHOLD = 100
+
+@dataclass
+class ConversationContext:
+    conversation_id: str
+    messages: List[Dict[str, str]] = field(default_factory=list)
+
+    def add(self, message: Dict[str, str], *, archive_fn):
+        self.messages.append(message)
+
+        if len(self.messages) > ARCHIVE_THRESHOLD:
+            to_archive = self.messages[:-MAX_CONTEXT_MESSAGES]
+            archive_fn(self.conversation_id, to_archive)
+            self.messages = self.messages[-MAX_CONTEXT_MESSAGES:]
+
+class ConversationArchiver:
+    def __init__(self, db):
+        self.db = db
+
+    def archive(self, conversation_id: str, messages: List[Dict[str, str]]):
+        self.db.execute("""
+            INSERT INTO conversation_archive (conversation_id, payload)
+            VALUES (%s, %s::jsonb)
+        """, (conversation_id, json.dumps(messages)))
+
+# ============================================================
+# 5️⃣ ORCHESTRATOR AVAILABILITY MITIGATION (LEADER ELECTION)
+# ============================================================
+
+class LeaderElector:
+    def __init__(self, db, lock_id: int):
+        self.db = db
+        self.lock_id = lock_id
+
+    def try_acquire(self) -> bool:
+        row = self.db.fetch_one(
+            "SELECT pg_try_advisory_lock(%s)", (self.lock_id,)
+        )
+        return bool(row[0])
+
+    def release(self):
+        self.db.execute(
+            "SELECT pg_advisory_unlock(%s)", (self.lock_id,)
+        )
+
+class Orchestrator:
+    def __init__(self, db):
+        self.db = db
+        self.stop_event = threading.Event()
+        self.elector = LeaderElector(db, lock_id=424242)
+
+    def run(self):
+        while not self.stop_event.is_set():
+            if not self.elector.try_acquire():
+                time.sleep(1)
+                continue
+
+            try:
+                self._process_loop()
+            finally:
+                self.elector.release()
+
+    def _process_loop(self):
+        # safe single-leader execution
+        self._process_tasks()
+        self._process_outbox()
+        self._supervise()
+
+    def shutdown(self):
+        self.stop_event.set()
+
+    def _process_tasks(self): ...
+    def _process_outbox(self): ...
+    def _supervise(self): ...
+
+# ============================================================
+# DB CONTRACT (ABSTRACTED)
+# ============================================================
+
+class Database:
+    def run_tx(self, fn):
+        with self.transaction() as cur:
+            return fn(cur)
+
+    def execute(self, sql, params=None): ...
+    def fetch_one(self, sql, params=None): ...
+    @contextmanager
+    def transaction(self): ...
+
+# ============================================================
+# END OF HARDENED PATCH
+# ============================================================
